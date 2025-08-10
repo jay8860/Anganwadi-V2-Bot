@@ -46,6 +46,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text="🙏 स्वागत है! कृपया हर दिन अपने आंगनवाड़ी की फ़ोटो इस समूह में भेजें।"
     )
 
+# put near other handlers
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    await update.message.reply_text(f"chat_id: {chat.id}")
+
+
 async def track_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m: ChatMemberUpdated = update.chat_member
     member = m.new_chat_member
@@ -156,6 +162,7 @@ def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.GROUPS, handle_photo))
     app.add_handler(ChatMemberHandler(track_new_members, ChatMemberHandler.CHAT_MEMBER))

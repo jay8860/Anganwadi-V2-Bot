@@ -1,15 +1,8 @@
-# anganwadi_v2_bot.py
-# Requirements:
-#   python-telegram-bot==21.6
-#   APScheduler==3.10.4  (not strictly needed now; we use JobQueue built into PTB)
-#
-# Environment variables to set on Render (or locally):
-#   TELEGRAM_BOT_TOKEN = <bot token from @BotFather>
-#   ALLOWED_CHAT_ID    = -100xxxxxxxxxxxx  (your group's chat_id; use /id to discover it first time)
-
+# anganwadi_v2_bot.py (multi-group ready)
 import os
 import asyncio
 import hashlib
+from collections import defaultdict
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
@@ -23,116 +16,110 @@ from telegram.ext import (
     filters,
 )
 
-# --------- Config from environment ----------
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]           # set this on Render
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 IST = ZoneInfo("Asia/Kolkata")
 
-# For the very first run, you may not know ALLOWED_CHAT_ID yet.
-# Temporarily set ALLOWED_CHAT_ID to "0" in Render so /id works anywhere.
-ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "0"))
+# Either ALLOWED_CHAT_IDS (comma-separated) or ALLOWED_CHAT_ID=0 during setup
+_raw_ids = os.environ.get("ALLOWED_CHAT_IDS")
+if _raw_ids:
+    ALLOWED_CHAT_IDS = {int(x.strip()) for x in _raw_ids.split(",") if x.strip()}
+else:
+    # Fallback: single value for first-time setup so /id works anywhere
+    ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "0"))
+    ALLOWED_CHAT_IDS = set() if ALLOWED_CHAT_ID == 0 else {ALLOWED_CHAT_ID}
 
-# Debug fingerprints (safe) to confirm correct values at runtime
 print("TOKEN_FINGERPRINT:", hashlib.sha256(TOKEN.encode()).hexdigest()[:12])
-print("ALLOWED_CHAT_ID:", ALLOWED_CHAT_ID)
+print("ALLOWED_CHAT_IDS:", sorted(list(ALLOWED_CHAT_IDS)) if ALLOWED_CHAT_IDS else "ANY (setup)")
 
-# --------- In-memory state ----------
-submissions = {}            # { "YYYY-MM-DD": { user_id: {"name": str, "time": "HH:MM"} } }
-streaks = {}                # { user_id: int }
-last_submission_date = {}   # { user_id: "YYYY-MM-DD" }
-known_users = {}            # { user_id: "FirstName" }
+# State per chat
+submissions = defaultdict(lambda: defaultdict(dict))     # submissions[chat_id][date][user_id] = {...}
+streaks = defaultdict(lambda: defaultdict(int))          # streaks[chat_id][user_id] = int
+last_submission_date = defaultdict(dict)                 # last_submission_date[chat_id][user_id] = "YYYY-MM-DD"
+known_users = defaultdict(dict)                          # known_users[chat_id][user_id] = "FirstName"
 
 def today_str():
     return datetime.now(tz=IST).strftime("%Y-%m-%d")
 
-def in_allowed_chat(update: Update) -> bool:
-    chat = update.effective_chat
-    if not chat:
-        return False
-    if ALLOWED_CHAT_ID == 0:
-        return True  # during first-setup phase so /id works anywhere
-    return chat.id == ALLOWED_CHAT_ID
+def is_allowed_chat(chat_id: int) -> bool:
+    if not ALLOWED_CHAT_IDS:
+        return True  # first-time setup so /id works anywhere
+    return chat_id in ALLOWED_CHAT_IDS
 
-# --------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_allowed_chat(update):
+    chat = update.effective_chat
+    if not chat or not is_allowed_chat(chat.id):
         return
-    print("Group ID seen:", update.effective_chat.id)
     await update.message.reply_text("🙏 स्वागत है! कृपया हर दिन अपने आंगनवाड़ी की फ़ोटो इस समूह में भेजें।")
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Use this once to discover chat_id, then set ALLOWED_CHAT_ID env var and redeploy.
     chat = update.effective_chat
     await update.message.reply_text(f"chat_id: {chat.id}")
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_allowed_chat(update):
+    chat = update.effective_chat
+    if not chat or not is_allowed_chat(chat.id):
         return
-    await post_summary(context)
+    await post_summary_for_chat(context, chat.id)
     await asyncio.sleep(1)
-    await post_top_streak_awards(context)
+    await post_awards_for_chat(context, chat.id)
 
-# --------- Group membership tracking ----------
 async def track_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m: ChatMemberUpdated = update.chat_member
-    if ALLOWED_CHAT_ID and m.chat.id != ALLOWED_CHAT_ID and ALLOWED_CHAT_ID != 0:
+    chat_id = m.chat.id
+    if not is_allowed_chat(chat_id):
         return
     member = m.new_chat_member
     if member.status in {"member", "administrator"}:
         user = member.user
-        known_users[user.id] = user.first_name or "User"
+        known_users[chat_id][user.id] = user.first_name or "User"
 
-# --------- Photo handling ----------
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_allowed_chat(update):
+    chat = update.effective_chat
+    if not chat or not is_allowed_chat(chat.id):
         return
     if not update.message or not update.message.photo:
         return
-
+    chat_id = chat.id
     user = update.effective_user
     if not user:
         return
     user_id = user.id
     name = user.first_name or "User"
-    known_users[user_id] = name
+    known_users[chat_id][user_id] = name
 
     date = today_str()
     now = datetime.now(tz=IST).strftime("%H:%M")
 
-    submissions.setdefault(date, {})
-    if user_id in submissions[date]:
-        return  # already submitted today
+    submissions[chat_id].setdefault(date, {})
+    if user_id in submissions[chat_id][date]:
+        return
 
-    submissions[date][user_id] = {"name": name, "time": now}
+    submissions[chat_id][date][user_id] = {"name": name, "time": now}
 
-    prev_date = last_submission_date.get(user_id)
+    prev_date = last_submission_date[chat_id].get(user_id)
     yesterday = (datetime.now(tz=IST) - timedelta(days=1)).strftime("%Y-%m-%d")
     if prev_date == yesterday:
-        streaks[user_id] = streaks.get(user_id, 0) + 1
+        streaks[chat_id][user_id] = streaks[chat_id].get(user_id, 0) + 1
     else:
-        streaks[user_id] = 1
-    last_submission_date[user_id] = date
+        streaks[chat_id][user_id] = 1
+    last_submission_date[chat_id][user_id] = date
 
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=f"✅ {name}, आपकी आज की फ़ोटो दर्ज कर ली गई है। बहुत अच्छे!"
-    )
+    await context.bot.send_message(chat_id=chat_id, text=f"✅ {name}, आपकी आज की फ़ोटो दर्ज कर ली गई है। बहुत अच्छे!")
 
-# --------- Reporting helpers ----------
-def _build_summary_text():
+def _build_summary_text(chat_id: int):
     date = today_str()
-    today_data = submissions.get(date, {})
+    today_data = submissions[chat_id].get(date, {})
     today_ids = set(today_data.keys())
-    member_ids = set(known_users.keys())
+    member_ids = set(known_users[chat_id].keys())
     pending_ids = member_ids - today_ids
 
     top_streaks = sorted(
-        [(uid, streaks[uid]) for uid in streaks if uid in member_ids],
-        key=lambda x: x[1],
-        reverse=True
+        [(uid, streaks[chat_id][uid]) for uid in streaks[chat_id] if uid in member_ids],
+        key=lambda x: x[1], reverse=True
     )[:5]
 
     leaderboard = "\n".join(
-        f"{i+1}. {known_users.get(uid, 'User')} – {count} दिन"
+        f"{i+1}. {known_users[chat_id].get(uid, 'User')} – {count} दिन"
         for i, (uid, count) in enumerate(top_streaks)
     )
 
@@ -146,53 +133,47 @@ def _build_summary_text():
     )
     return summary
 
-async def post_summary(context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=ALLOWED_CHAT_ID if ALLOWED_CHAT_ID else context._chat_id, text=_build_summary_text())
+async def post_summary_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    await context.bot.send_message(chat_id=chat_id, text=_build_summary_text(chat_id))
 
-async def post_top_streak_awards(context: ContextTypes.DEFAULT_TYPE):
-    member_ids = set(known_users.keys())
+async def post_awards_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    member_ids = set(known_users[chat_id].keys())
     top_streaks = sorted(
-        [(uid, streaks[uid]) for uid in streaks if uid in member_ids],
-        key=lambda x: x[1],
-        reverse=True
+        [(uid, streaks[chat_id][uid]) for uid in streaks[chat_id] if uid in member_ids],
+        key=lambda x: x[1], reverse=True
     )[:5]
     if not top_streaks:
         return
     medals = ["🥇", "🥈", "🥉", "🎖️", "🏅"]
     for i, (uid, count) in enumerate(top_streaks):
-        name = known_users.get(uid, f"User {uid}")
+        name = known_users[chat_id].get(uid, f"User {uid}")
         msg = f"{medals[i]} *{name}*, आप आज #{i+1} स्थान पर हैं — {count} दिनों की शानदार रिपोर्टिंग के साथ! 🎉👏"
-        await context.bot.send_message(chat_id=ALLOWED_CHAT_ID if ALLOWED_CHAT_ID else context._chat_id, text=msg, parse_mode="Markdown")
+        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
         await asyncio.sleep(1)
 
-# --------- Scheduling with JobQueue (built into PTB) ----------
+# JobQueue callbacks (we pass chat_id via job.data)
+async def job_summary(context: ContextTypes.DEFAULT_TYPE):
+    await post_summary_for_chat(context, context.job.data)
+
+async def job_awards(context: ContextTypes.DEFAULT_TYPE):
+    await post_awards_for_chat(context, context.job.data)
+
 def schedule_reports(app):
     jq = app.job_queue
-    # Three daily schedules in IST (10:00, 14:00, 18:00) + awards 2 minutes later
-    jq.run_daily(callback=post_summary, time=time(hour=10, minute=0, tzinfo=IST))
-    jq.run_daily(callback=post_top_streak_awards, time=time(hour=10, minute=2, tzinfo=IST))
+    times = [(10,0),(14,0),(18,0)]
+    target_chats = ALLOWED_CHAT_IDS or set()  # empty when in setup; skip scheduling until set
+    for cid in target_chats:
+        for hh, mm in times:
+            jq.run_daily(callback=job_summary, time=time(hour=hh, minute=0, tzinfo=IST), data=cid)
+            jq.run_daily(callback=job_awards,  time=time(hour=hh, minute=2, tzinfo=IST), data=cid)
 
-    jq.run_daily(callback=post_summary, time=time(hour=14, minute=0, tzinfo=IST))
-    jq.run_daily(callback=post_top_streak_awards, time=time(hour=14, minute=2, tzinfo=IST))
-
-    jq.run_daily(callback=post_summary, time=time(hour=18, minute=0, tzinfo=IST))
-    jq.run_daily(callback=post_top_streak_awards, time=time(hour=18, minute=2, tzinfo=IST))
-
-# --------- Entrypoint ----------
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
-
-    # Command handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("id", cmd_id))       # temporary; helps you get chat_id
+    app.add_handler(CommandHandler("id", cmd_id))   # keep for future groups
     app.add_handler(CommandHandler("report", cmd_report))
-
-    # Photo handler (groups only)
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.GROUPS, handle_photo))
-
-    # Track joins/role changes
     app.add_handler(ChatMemberHandler(track_new_members, ChatMemberHandler.CHAT_MEMBER))
-
     schedule_reports(app)
     print("Bot online. Waiting for updates...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

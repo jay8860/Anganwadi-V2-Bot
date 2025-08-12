@@ -258,7 +258,7 @@ def main():
 
     schedule_reports(app)
     print("Bot online. Waiting for updates...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
